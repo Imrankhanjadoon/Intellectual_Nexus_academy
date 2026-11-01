@@ -3,7 +3,7 @@ from datetime import date
 from decimal import Decimal
 
 from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMainWindow, QPushButton, QScrollArea, QStackedWidget,
@@ -13,6 +13,8 @@ from PySide6.QtWidgets import (
 from .common import BasePage, fill_table, heading, money, show_error, success, table
 from .identity import AcademySeal, line_icon, seal_pixmap
 from .visuals import SettlementChart
+from .motion import fade_in
+from .. import __version__
 
 
 ROLE_NAMES = {
@@ -265,6 +267,7 @@ class DashboardPage(BasePage):
 
 class MainWindow(QMainWindow):
     logout_requested = Signal()
+    reauthentication_required = Signal()
 
     def __init__(self, service):
         super().__init__()
@@ -424,7 +427,11 @@ class MainWindow(QMainWindow):
         self.breadcrumb = QLabel()
         breadcrumb_layout.addWidget(self.breadcrumb)
         breadcrumb_layout.addStretch()
-        breadcrumb_layout.addWidget(QLabel("ACADEMY MANAGEMENT SYSTEM"))
+        self.search_launcher = QPushButton("Search records   Ctrl+K")
+        self.search_launcher.setObjectName("searchLauncher")
+        self.search_launcher.setIcon(line_icon("search", "#7386a1", 18))
+        self.search_launcher.clicked.connect(self.open_search)
+        breadcrumb_layout.addWidget(self.search_launcher)
         content.addWidget(breadcrumb_bar)
         self.page_scroll = QScrollArea()
         self.page_scroll.setWidgetResizable(True)
@@ -434,9 +441,15 @@ class MainWindow(QMainWindow):
         root_layout.addLayout(body, 1)
         self.pages["dashboard"].navigate.connect(self.navigate)
         if "settings" in self.pages:
-            self.pages["settings"].auth_required.connect(self.logout_requested)
+            self.pages["settings"].auth_required.connect(self.reauthentication_required)
+        self.find_shortcut = QShortcut(QKeySequence.StandardKey.Find, self)
+        self.find_shortcut.activated.connect(self.focus_search)
+        self.refresh_shortcut = QShortcut(QKeySequence("Ctrl+R"), self)
+        self.refresh_shortcut.activated.connect(self.refresh_current)
+        self.global_search_shortcut = QShortcut(QKeySequence("Ctrl+K"), self)
+        self.global_search_shortcut.activated.connect(self.open_search)
         self.statusBar().setSizeGripEnabled(False)
-        self.statusBar().showMessage("Intellectual Nexus Academy   /   Internal administration")
+        self.statusBar().showMessage(f"Intellectual Nexus Academy   /   v{__version__}   /   Internal administration")
         status = QLabel("Local records  ·  Offline workspace")
         status.setContentsMargins(0, 0, 16, 0)
         self.statusBar().addPermanentWidget(status)
@@ -448,6 +461,7 @@ class MainWindow(QMainWindow):
         try:
             self.pages[key].refresh()
             self.stack.setCurrentWidget(self.pages[key])
+            fade_in(self.pages[key])
             self.stack.updateGeometry()
             self.page_scroll.verticalScrollBar().setValue(0)
             self.breadcrumb.setText("Academy portal   /   " + self.page_titles[key])
@@ -465,6 +479,54 @@ class MainWindow(QMainWindow):
             self.academy_label.setText(self.service.get_settings()["academy_name"])
         except (ValueError, PermissionError, RuntimeError) as exc:
             show_error(self, exc)
+
+    def focus_search(self):
+        page = self.stack.currentWidget()
+        if hasattr(page, "focus_search"):
+            page.focus_search()
+            return
+        field = getattr(page, "search", None)
+        if isinstance(field, QLineEdit):
+            field.setFocus()
+            field.selectAll()
+
+    def open_search(self):
+        from .search import GlobalSearchDialog
+        dialog = GlobalSearchDialog(self.service, self)
+        dialog.navigate.connect(self._search_result)
+        dialog.exec()
+
+    def _search_result(self, key, query):
+        if key not in self.pages:
+            return
+        self.navigate(key)
+        page = self.pages[key]
+        if not query:
+            return
+        if key == "fees":
+            receipt = query.startswith("RC-")
+            page.tabs.setCurrentIndex(1 if receipt else 0)
+            if not receipt:
+                page.status.setCurrentText("All")
+            (page.payment_search if receipt else page.search).setText(query)
+        elif key == "attendance":
+            for index in range(page.class_combo.count()):
+                if page.class_combo.itemText(index).split(" · ")[0] == query:
+                    page.class_combo.setCurrentIndex(index)
+                    break
+        else:
+            if key == "students":
+                if query.startswith("class:"):
+                    page.tabs.setCurrentIndex(1)
+                    for row in range(page.classes_table.rowCount()):
+                        if page.classes_table.item(row, 0).text() == query.removeprefix("class:"):
+                            page.classes_table.selectRow(row)
+                            break
+                    return
+                page.tabs.setCurrentIndex(0)
+            field = getattr(page, "search", None)
+            if isinstance(field, QLineEdit):
+                field.setText(query)
 
     def change_password(self):
         dialog = QDialog(self)

@@ -1,4 +1,5 @@
 .venv/
+.venv312/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -9,3 +10,6 @@ dist/
 *.sqlite3
 *.sqlite3-*
 .DS_Store
+*.nexus-key
+.nexus-key-*.tmp
+nexus-owner-recovery.txt

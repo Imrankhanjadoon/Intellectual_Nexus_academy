@@ -6,9 +6,10 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
-from PySide6.QtCore import QDate, QStandardPaths, Qt, QUrl
+from PySide6.QtCore import QDate, QStandardPaths, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QFont
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDateEdit,
     QDialog,
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QTabWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -84,7 +86,7 @@ def _pdf_path(parent, title, filename):
 
 
 def _tint_status(widget, rows, column):
-    colors = {"Paid": "#245a42", "Partially paid": "#81672f", "Unpaid": "#8a3b32", "Reversed": "#81672f", "Received": "#245a42"}
+    colors = {"Paid": "#245a42", "Partially paid": "#81672f", "Unpaid": "#8a3b32", "Reversed": "#81672f", "Received": "#245a42", "No payment due": "#365478"}
     for row, values in enumerate(rows):
         item = widget.item(row, column)
         if item:
@@ -105,6 +107,27 @@ def _ledger_columns(widget, flexible, amounts=()):
         widget.horizontalHeaderItem(column).setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         for row in range(widget.rowCount()):
             widget.item(row, column).setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+
+def _restore_table_view(widget, record_id, vertical, horizontal):
+    row = next((index for index in range(widget.rowCount()) if widget.item(index, 0).data(Qt.UserRole) == record_id), None) if record_id is not None else None
+    if row is None:
+        widget.clearSelection()
+        widget.setCurrentCell(-1, -1)
+    else:
+        widget.selectRow(row)
+    widget.verticalScrollBar().setValue(vertical)
+    widget.horizontalScrollBar().setValue(horizontal)
+
+
+def _fee_hint(total, exempt):
+    if total > 0:
+        return "Unpaid — payment will be recorded separately."
+    if total == 0 and exempt:
+        return "No payment due — no payment or receipt will be recorded."
+    if total == 0:
+        return "Enter the fee amount, or select Fee-exempt / no charges to confirm an intentional zero-fee challan."
+    return "The discount cannot exceed the assessed charges."
 
 
 class ChallanDialog(QDialog):
@@ -136,7 +159,11 @@ class ChallanDialog(QDialog):
         self.total.setObjectName("sectionTitle")
         outer.addWidget(_field_group("01  Student account", [("Student *", self.student)], columns=1))
         outer.addWidget(_field_group("02  Billing details", [("Fee month", self.period), ("Due date", self.due)]))
-        outer.addWidget(_field_group("03  Fee assessment", [("Tuition", self.tuition), ("Other charges", self.other), ("Discount", self.discount)], columns=3))
+        fee_group = _field_group("03  Fee assessment", [("Tuition", self.tuition), ("Other charges", self.other), ("Discount", self.discount)], columns=3)
+        self.fee_exempt = QCheckBox("Fee-exempt / no charges")
+        self.fee_exempt.setToolTip("Select only when the assessed fee is intentionally zero.")
+        fee_group.layout().addWidget(self.fee_exempt, 1, 0, 1, 3)
+        outer.addWidget(fee_group)
         assessment = QFrame()
         assessment.setObjectName("card")
         assessment_layout = QHBoxLayout(assessment)
@@ -145,6 +172,8 @@ class ChallanDialog(QDialog):
         self.total.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         assessment_layout.addWidget(self.total)
         outer.addWidget(assessment)
+        self.status_hint = _note("")
+        outer.addWidget(self.status_hint)
         outer.addWidget(_note("One challan is permitted per student per month. The admission challan covers the month of admission."))
         self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         self.buttons.button(QDialogButtonBox.Save).setText("Create challan")
@@ -155,6 +184,7 @@ class ChallanDialog(QDialog):
         self.student.currentIndexChanged.connect(self._student_changed)
         for field in (self.tuition, self.other, self.discount):
             field.valueChanged.connect(self._update_total)
+        self.fee_exempt.toggled.connect(self._update_total)
         self._update_total()
 
     def _student_changed(self, index):
@@ -162,14 +192,26 @@ class ChallanDialog(QDialog):
             self.tuition.setValue(float(self.students[index]["monthly_fee"]))
 
     def _update_total(self):
-        self.total.setText(money(self.tuition.value() + self.other.value() - self.discount.value()))
+        total = self._net_total()
+        self.total.setText(money(total))
+        self.fee_exempt.setEnabled(total == 0)
+        if total > 0:
+            self.fee_exempt.setChecked(False)
+        self.status_hint.setText(_fee_hint(total, self.fee_exempt.isChecked()))
+
+    def _net_total(self):
+        return Decimal(str(self.tuition.value())) + Decimal(str(self.other.value())) - Decimal(str(self.discount.value()))
 
     def _save(self):
+        if self.result() == QDialog.Accepted:
+            return
         try:
             if self.student.currentData() is None:
                 raise ValueError("Choose a student first.")
-            if self.discount.value() > self.tuition.value() + self.other.value():
+            if self._net_total() < 0:
                 raise ValueError("The discount cannot exceed the charges.")
+            if self._net_total() == 0 and not self.fee_exempt.isChecked():
+                raise ValueError("This challan has no charges. Enter the fee amount, or explicitly select Fee-exempt / no charges. No payment will be recorded for a zero-fee challan.")
             self.buttons.button(QDialogButtonBox.Save).setEnabled(False)
             self.result_record = self.service.create_challan(
                 student_id=self.student.currentData(),
@@ -178,6 +220,98 @@ class ChallanDialog(QDialog):
                 discount=str(self.discount.value()),
                 due_date=self.due.date().toString(Qt.ISODate),
                 other=str(self.other.value()),
+                fee_exempt=self.fee_exempt.isChecked(),
+            )
+            self.accept()
+        except Exception as exc:
+            self.buttons.button(QDialogButtonBox.Save).setEnabled(True)
+            show_error(self, exc)
+
+
+class AmendChallanDialog(QDialog):
+    """Correct an issued bill while preserving payment and audit history."""
+
+    def __init__(self, service, challan, parent=None):
+        super().__init__(parent)
+        self.service = service
+        self.challan = challan
+        self.result_record = None
+        self.setWindowTitle("Amend fee challan")
+        self.setMinimumWidth(650)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(28, 28, 28, 28)
+        outer.setSpacing(16)
+        outer.addWidget(heading("Challan amendment", f"{challan['number']}  |  {challan['student_name']}  |  {challan['period']}"))
+        outer.addWidget(_note(f"Current total: {money(challan['total'])}. Amendments are permitted only before any payment has been recorded, including a reversed payment. The reason and previous amounts remain in the audit history."))
+        self.tuition = _amount(challan.get("tuition", 0))
+        self.other = _amount(challan.get("other", 0))
+        self.discount = _amount(challan.get("discount", 0))
+        self.due = QDateEdit(QDate.fromString(challan["due_date"], Qt.ISODate))
+        self.due.setCalendarPopup(True)
+        self.due.setDisplayFormat("dd MMM yyyy")
+        fee_group = _field_group("Revised assessment", [("Tuition", self.tuition), ("Other / admission charges", self.other), ("Discount", self.discount), ("Due date", self.due)])
+        self.fee_exempt = QCheckBox("Fee-exempt / no charges")
+        self.fee_exempt.setToolTip("Explicitly confirm if the revised amount is intentionally zero.")
+        fee_group.layout().addWidget(self.fee_exempt, 2, 0, 1, 2)
+        outer.addWidget(fee_group)
+        self.reason = QTextEdit()
+        self.reason.setPlaceholderText("Explain the correction, for example: Tuition omitted at admission.")
+        self.reason.setMaximumHeight(85)
+        reason_label = QLabel("Reason for amendment *")
+        reason_label.setObjectName("fieldLabel")
+        reason_label.setBuddy(self.reason)
+        outer.addWidget(reason_label)
+        outer.addWidget(self.reason)
+        summary = QFrame()
+        summary.setObjectName("card")
+        summary_layout = QHBoxLayout(summary)
+        summary_layout.setContentsMargins(16, 12, 16, 12)
+        summary_layout.addWidget(QLabel("Revised challan total"), 1)
+        self.total = QLabel()
+        self.total.setObjectName("sectionTitle")
+        self.total.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        summary_layout.addWidget(self.total)
+        outer.addWidget(summary)
+        self.status_hint = _note("")
+        outer.addWidget(self.status_hint)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        self.buttons.button(QDialogButtonBox.Save).setText("Save amendment")
+        self.buttons.button(QDialogButtonBox.Save).setObjectName("primary")
+        self.buttons.accepted.connect(self._save)
+        self.buttons.rejected.connect(self.reject)
+        outer.addWidget(self.buttons)
+        for field in (self.tuition, self.other, self.discount):
+            field.valueChanged.connect(self._update_total)
+        self.fee_exempt.toggled.connect(self._update_total)
+        self._update_total()
+
+    def _net_total(self):
+        return Decimal(str(self.tuition.value())) + Decimal(str(self.other.value())) - Decimal(str(self.discount.value()))
+
+    def _update_total(self):
+        total = self._net_total()
+        self.total.setText(money(total))
+        self.fee_exempt.setEnabled(total == 0)
+        if total > 0:
+            self.fee_exempt.setChecked(False)
+        self.status_hint.setText(_fee_hint(total, self.fee_exempt.isChecked()))
+
+    def _save(self):
+        if self.result() == QDialog.Accepted:
+            return
+        try:
+            if self._net_total() < 0:
+                raise ValueError("The discount cannot exceed the charges.")
+            if self._net_total() == 0 and not self.fee_exempt.isChecked():
+                raise ValueError("Enter the corrected fee amount, or explicitly select Fee-exempt / no charges to confirm a zero-fee challan.")
+            if not self.reason.toPlainText().strip():
+                raise ValueError("Enter a reason for this amendment so the correction is recorded in the audit history.")
+            self.buttons.button(QDialogButtonBox.Save).setEnabled(False)
+            self.result_record = self.service.amend_challan(
+                challan_id=self.challan["id"], tuition=str(self.tuition.value()),
+                other=str(self.other.value()), discount=str(self.discount.value()),
+                due_date=self.due.date().toString(Qt.ISODate), reason=self.reason.toPlainText().strip(),
+                fee_exempt=self.fee_exempt.isChecked(),
             )
             self.accept()
         except Exception as exc:
@@ -232,6 +366,8 @@ class PaymentDialog(QDialog):
         outer.addWidget(self.buttons)
 
     def _save(self):
+        if self.result() == QDialog.Accepted:
+            return
         try:
             if self.amount.value() <= 0:
                 raise ValueError("Enter a payment amount greater than zero.")
@@ -288,9 +424,14 @@ class FeesPage(BasePage):
         self.search = QLineEdit()
         self.search.setPlaceholderText("Student name, challan number or registration number")
         self.search.setClearButtonEnabled(True)
-        self.search.textChanged.connect(self._load_challans)
+        self.search.setToolTip("Search the challan register. Press Ctrl+F to focus this field; status filters remain applied.")
+        self._challan_search_timer = QTimer(self)
+        self._challan_search_timer.setSingleShot(True)
+        self._challan_search_timer.setInterval(180)
+        self._challan_search_timer.timeout.connect(self._load_challans)
+        self.search.textChanged.connect(lambda *_: self._challan_search_timer.start())
         self.status = QComboBox()
-        self.status.addItems(["All", "Unpaid", "Partially paid", "Paid", "Overdue"])
+        self.status.addItems(["All", "Unpaid", "Partially paid", "Paid", "No payment due", "Overdue"])
         self.status.setMinimumWidth(155)
         self.status.currentTextChanged.connect(self._load_challans)
         filters.addWidget(self.search, 1)
@@ -320,12 +461,16 @@ class FeesPage(BasePage):
         view.clicked.connect(self._view_challan)
         export = QPushButton("Save challan PDF")
         export.clicked.connect(self._export_selected_challan)
+        self.amend = QPushButton("Amend challan")
+        self.amend.setToolTip("Correct charges before any payment has been recorded. A reason is required.")
+        self.amend.clicked.connect(self._amend_selected)
         self.receive = QPushButton("Receive payment")
         self.receive.setObjectName("primary")
         self.receive.setVisible(self.can_receive)
         self.receive.clicked.connect(self._receive_selected)
         actions.addWidget(view)
         actions.addWidget(export)
+        actions.addWidget(self.amend)
         actions.addStretch()
         actions.addWidget(self.receive)
         challan_layout.addWidget(action_bar)
@@ -350,7 +495,12 @@ class FeesPage(BasePage):
         self.payment_search = QLineEdit()
         self.payment_search.setPlaceholderText("Student name, receipt number or challan number")
         self.payment_search.setClearButtonEnabled(True)
-        self.payment_search.textChanged.connect(self._load_payments)
+        self.payment_search.setToolTip("Search payment receipts. Press Ctrl+F to focus this field; use the clear button to reset the search.")
+        self._payment_search_timer = QTimer(self)
+        self._payment_search_timer.setSingleShot(True)
+        self._payment_search_timer.setInterval(180)
+        self._payment_search_timer.timeout.connect(self._load_payments)
+        self.payment_search.textChanged.connect(lambda *_: self._payment_search_timer.start())
         payment_filters.addWidget(self.payment_search, 1)
         payment_layout.addWidget(payment_toolbar)
         self.payment_table = table(["RECEIPT NO.", "STUDENT NAME", "CHALLAN NO.", "DATE", "AMOUNT", "METHOD", "RECEIVED BY", "STATUS"])
@@ -389,11 +539,16 @@ class FeesPage(BasePage):
 
     def _load_challans(self, *_):
         try:
+            self._challan_search_timer.stop()
+            challan_id = selected_id(self.challan_table)
+            vertical = self.challan_table.verticalScrollBar().value()
+            horizontal = self.challan_table.horizontalScrollBar().value()
             self.challans = self.service.list_challans(self.search.text().strip(), self.status.currentText())
             rows = [[c["number"], c["student_name"], c["period"], c["due_date"], money(c["total"]), money(c["paid"]), money(c["balance"]), c["status"]] for c in self.challans]
             fill_table(self.challan_table, rows, [c["id"] for c in self.challans])
             _tint_status(self.challan_table, rows, 7)
             _ledger_columns(self.challan_table, (1,), (4, 5, 6))
+            _restore_table_view(self.challan_table, challan_id, vertical, horizontal)
             total_balance = sum((Decimal(str(c["balance"])) for c in self.challans), Decimal(0))
             self.summary.setText(f"Records: {len(self.challans):,}    |    Outstanding balance for displayed records: {money(total_balance)}")
             self.challan_empty.setVisible(not self.challans)
@@ -405,11 +560,16 @@ class FeesPage(BasePage):
 
     def _load_payments(self, *_):
         try:
+            self._payment_search_timer.stop()
+            payment_id = selected_id(self.payment_table)
+            vertical = self.payment_table.verticalScrollBar().value()
+            horizontal = self.payment_table.horizontalScrollBar().value()
             self.payments = self.service.list_payments(self.payment_search.text().strip())
             rows = [[p["number"], p["student_name"], p["challan_number"], p["paid_on"][:10], money(p["amount"]), p["method"], p["received_by"], "Reversed" if p["reversed"] else "Received"] for p in self.payments]
             fill_table(self.payment_table, rows, [p["id"] for p in self.payments])
             _tint_status(self.payment_table, rows, 7)
             _ledger_columns(self.payment_table, (1, 6), (4,))
+            _restore_table_view(self.payment_table, payment_id, vertical, horizontal)
             for row, payment in enumerate(self.payments):
                 self.payment_table.item(row, 3).setToolTip(payment["paid_on"])
             self.payment_empty.setVisible(not self.payments)
@@ -421,6 +581,30 @@ class FeesPage(BasePage):
         challan_id = selected_id(self.challan_table)
         challan = next((c for c in self.challans if c["id"] == challan_id), None)
         self.receive.setEnabled(bool(challan and Decimal(str(challan["balance"])) > 0))
+        try:
+            can_amend = bool(challan and not self.service.challan_details(challan_id).get("payments"))
+            self.amend.setEnabled(can_amend)
+            self.amend.setToolTip("Correct charges before any payment has been recorded. A reason is required." if can_amend else "Select a challan with no payment history. Bills with recorded or reversed payments cannot be amended.")
+        except Exception:
+            self.amend.setEnabled(False)
+
+    def focus_search(self):
+        field = self.payment_search if self.tabs.currentIndex() == 1 else self.search
+        field.setFocus()
+        field.selectAll()
+
+    def _amend_selected(self):
+        try:
+            challan = self._selected_challan()
+            if challan.get("payments"):
+                raise ValueError("This challan has payment history and cannot be amended, including after a reversal. Its financial record must remain unchanged.")
+            dialog = AmendChallanDialog(self.service, challan, self)
+            if dialog.exec() == QDialog.Accepted:
+                self.refresh()
+                self.changed.emit()
+                success(self, f"Challan {dialog.result_record['number']} amended.\n\nTotal: {money(dialog.result_record['total'])}\nStatus: {dialog.result_record['status']}\n\nThe correction and reason have been retained in the audit history.")
+        except Exception as exc:
+            show_error(self, exc)
 
     def _selected_challan(self):
         challan_id = selected_id(self.challan_table)
@@ -451,7 +635,7 @@ class FeesPage(BasePage):
         if not self.can_receive:
             raise PermissionError("Only an administrator or cashier can receive payments.")
         if Decimal(str(challan["balance"])) <= 0:
-            raise ValueError("This challan is already paid in full.")
+            raise ValueError("This challan has no payment due." if Decimal(str(challan["total"])) == 0 else "This challan is already paid in full.")
         dialog = PaymentDialog(self.service, challan, self)
         if dialog.exec() == QDialog.Accepted:
             self.refresh()

@@ -2,7 +2,7 @@
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
@@ -92,6 +92,11 @@ def _panel_header(title, description=""):
 class UsersPage(BasePage):
     def __init__(self, service, parent=None):
         super().__init__(service, parent)
+        self._users = []
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(180)
+        self._filter_timer.timeout.connect(self._apply_filter)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 30, 30, 30)
         layout.setSpacing(18)
@@ -105,6 +110,18 @@ class UsersPage(BasePage):
         body = QVBoxLayout()
         body.setContentsMargins(22, 18, 22, 18)
         body.setSpacing(16)
+        search_row = QHBoxLayout()
+        search_row.setSpacing(10)
+        self.search = QLineEdit()
+        self.search.setObjectName("search")
+        self.search.setAccessibleName("Search staff accounts")
+        self.search.setPlaceholderText("Search name, username, role or account status…")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(lambda *_: self._filter_timer.start())
+        search_row.addWidget(self.search, 1)
+        self.clear_filter = _button("Clear search", self._clear_filter)
+        search_row.addWidget(self.clear_filter)
+        body.addLayout(search_row)
         self.summary = QLabel("No staff accounts yet")
         self.summary.setObjectName("muted")
         register_meta = QHBoxLayout()
@@ -136,11 +153,52 @@ class UsersPage(BasePage):
 
     def refresh(self):
         try:
-            users = self.service.list_users()
-            fill_table(self.accounts, [[u["full_name"], u["username"], ROLE_LABELS.get(u["role"], "Owner / Administrator"), u["status"].title()] for u in users], users)
-            pending = sum(u["status"].lower() == "pending" for u in users)
-            active = sum(u["status"].lower() == "active" for u in users)
-            self.summary.setText(f"{active} active account{'s' if active != 1 else ''}  ·  {pending} awaiting approval")
+            self._users = self.service.list_users()
+            self._filter_timer.stop()
+            self._apply_filter()
+        except Exception as exc:
+            show_error(self, exc)
+
+    def _clear_filter(self):
+        self.search.clear()
+        self._filter_timer.stop()
+        self._apply_filter()
+        self.search.setFocus()
+
+    def _apply_filter(self):
+        try:
+            tokens = self.search.text().strip().casefold().split()
+            previous = selected_id(self.accounts)
+            previous_id = previous["id"] if previous else None
+            users = [
+                user for user in self._users
+                if all(token in " ".join([
+                    user["full_name"], user["username"], user["role"],
+                    ROLE_LABELS.get(user["role"], "Owner Administrator"), user["status"],
+                ]).casefold() for token in tokens)
+            ]
+            self.accounts.blockSignals(True)
+            try:
+                fill_table(self.accounts, [
+                    [u["full_name"], u["username"], ROLE_LABELS.get(u["role"], "Owner / Administrator"), u["status"].title()]
+                    for u in users
+                ], users)
+                self.accounts.clearSelection()
+                self.accounts.setCurrentCell(-1, -1)
+                for index, user in enumerate(users):
+                    if user["id"] == previous_id:
+                        self.accounts.selectRow(index)
+                        break
+            finally:
+                self.accounts.blockSignals(False)
+            pending = sum(u["status"].lower() == "pending" for u in self._users)
+            active = sum(u["status"].lower() == "active" for u in self._users)
+            self.summary.setText(
+                f"{len(users)} of {len(self._users)} accounts shown  ·  {active} active in total  ·  {pending} awaiting approval"
+            )
+            if tokens and not users:
+                self.summary.setText("No accounts match this search. Clear the search to view all staff.")
+            self.clear_filter.setEnabled(bool(self.search.text()))
             self._selection_changed()
         except Exception as exc:
             show_error(self, exc)
@@ -319,12 +377,18 @@ class SettingsPage(BasePage):
         details_layout.addStretch()
         security, security_layout = _panel()
         security_layout.addWidget(_section("Owner account", "Account credentials and recovery access."))
-        security_note = QLabel("Keep the owner password private. Store the recovery code separately from this computer and the academy database.")
+        security_note = QLabel("Keep a password reset file on a separate drive. Select it from Reset password if you forget the owner password.")
         security_note.setObjectName("muted")
         security_note.setWordWrap(True)
         security_layout.addWidget(security_note)
         security_layout.addSpacing(8)
         security_layout.addWidget(_button("Change my password…", self._change_password))
+        self.save_reset_file = _button("Save password reset file…", self._save_reset_file)
+        security_layout.addWidget(self.save_reset_file)
+        self.reset_file_status = QLabel("Saving a new reset file replaces the previous one.")
+        self.reset_file_status.setObjectName("muted")
+        self.reset_file_status.setWordWrap(True)
+        security_layout.addWidget(self.reset_file_status)
         security_layout.addStretch()
         layout.addWidget(details, 2)
         layout.addWidget(security, 1)
@@ -449,6 +513,53 @@ class SettingsPage(BasePage):
                 show_error(dialog, exc)
 
         buttons.accepted.connect(save)
+        dialog.exec()
+
+    def _save_reset_file(self):
+        dialog, layout = _dialog("Save password reset file", self)
+        layout.addWidget(heading(
+            "Save password reset file",
+            "Confirm your current password, then choose where to save the file. Keep it on a separate drive. A new file replaces the previous reset file.",
+        ))
+        password = _field("Current owner password", True)
+        password.setObjectName("currentPassword")
+        form = QFormLayout()
+        form.addRow("Current password", password)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Choose save location…")
+        buttons.button(QDialogButtonBox.StandardButton.Save).setObjectName("primary")
+        buttons.button(QDialogButtonBox.StandardButton.Save).setDefault(True)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        def save():
+            if not password.text():
+                show_error(dialog, ValueError("Enter your current owner password."))
+                password.setFocus()
+                return
+            destination, _ = QFileDialog.getSaveFileName(
+                dialog, "Save password reset file", "academy-password-reset.nexus-key",
+                "Academy password reset file (*.nexus-key)",
+            )
+            if not destination:
+                return
+            if not destination.lower().endswith(".nexus-key"):
+                destination += ".nexus-key"
+            try:
+                path = self.service.save_recovery_file(destination, current_password=password.text())
+                password.clear()
+                self.reset_file_status.setText(f"Password reset file saved: {path}")
+                self._refresh_audit()
+                dialog.accept()
+                success(self, "Password reset file saved. Keep it on a separate drive. Any older reset file has been replaced.")
+            except Exception as exc:
+                password.clear()
+                show_error(dialog, exc)
+                password.setFocus()
+
+        buttons.accepted.connect(save)
+        dialog.finished.connect(lambda *_: password.clear())
         dialog.exec()
 
     def _backup(self):

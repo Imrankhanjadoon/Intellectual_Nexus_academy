@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QDate, Qt
+from decimal import Decimal
+
+from PySide6.QtCore import QDate, Qt, QTimer
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDateEdit,
     QDialog,
@@ -97,6 +100,17 @@ def _register_columns(widget, flexible, amounts=()):
             widget.item(row, column).setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
 
+def _restore_table_view(widget, record_id, vertical, horizontal):
+    row = next((index for index in range(widget.rowCount()) if widget.item(index, 0).data(Qt.UserRole) == record_id), None) if record_id is not None else None
+    if row is None:
+        widget.clearSelection()
+        widget.setCurrentCell(-1, -1)
+    else:
+        widget.selectRow(row)
+    widget.verticalScrollBar().setValue(vertical)
+    widget.horizontalScrollBar().setValue(horizontal)
+
+
 class ClassDialog(QDialog):
     def __init__(self, service, parent=None, group=None):
         super().__init__(parent)
@@ -135,6 +149,7 @@ class ClassDialog(QDialog):
         outer.addLayout(form)
         outer.addWidget(_note("Only active, approved teachers may be assigned. Revised tuition applies to new admissions; existing student fees and issued challans are unaffected."))
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        self.buttons = buttons
         buttons.button(QDialogButtonBox.Save).setText("Save changes" if group else "Create class")
         buttons.button(QDialogButtonBox.Save).setObjectName("primary")
         buttons.accepted.connect(self._save)
@@ -143,16 +158,20 @@ class ClassDialog(QDialog):
         self.name.setFocus()
 
     def _save(self):
+        if self.result() == QDialog.Accepted:
+            return
         try:
             if not self.name.text().strip():
                 raise ValueError("Enter a class or batch name.")
             values = dict(name=self.name.text().strip(), schedule=self.schedule.text().strip(), monthly_fee=str(self.fee.value()), teacher_id=self.teacher.currentData())
+            self.buttons.button(QDialogButtonBox.Save).setEnabled(False)
             if self.group:
                 self.service.update_class(self.group["id"], **values)
             else:
                 self.service.add_class(**values)
             self.accept()
         except Exception as exc:
+            self.buttons.button(QDialogButtonBox.Save).setEnabled(True)
             show_error(self, exc)
 
 
@@ -205,10 +224,14 @@ class AdmissionDialog(QDialog):
             ("Contact number *", self.phone), ("Class / batch *", self.class_picker),
             ("Admission date", self.admitted_on),
         ]))
-        form.addWidget(_field_group("02  Initial fee assessment", [
+        fee_group = _field_group("02  Initial fee assessment", [
             ("Monthly tuition", self.monthly_fee), ("Admission fee", self.admission_fee),
             ("Initial discount", self.discount), ("Payment due date", self.due_date),
-        ]))
+        ])
+        self.fee_exempt = QCheckBox("Fee-exempt / no charges")
+        self.fee_exempt.setToolTip("Select only when the assessed fee is intentionally zero. No payment or receipt will be recorded.")
+        fee_group.layout().addWidget(self.fee_exempt, 2, 0, 1, 2)
+        form.addWidget(fee_group)
         form.addWidget(_field_group("03  Additional information", [
             ("Residential address", self.address), ("Administrative remarks", self.notes),
         ]))
@@ -223,6 +246,8 @@ class AdmissionDialog(QDialog):
         self.total_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         assessment_layout.addWidget(self.total_label)
         outer.addWidget(assessment)
+        self.status_hint = _note("")
+        outer.addWidget(self.status_hint)
         outer.addWidget(_note("The initial challan covers the month of admission. Any discount entered here applies only to this challan."))
         self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         self.buttons.button(QDialogButtonBox.Save).setText("Confirm admission")
@@ -233,6 +258,7 @@ class AdmissionDialog(QDialog):
         self.class_picker.currentIndexChanged.connect(self._class_changed)
         for field in (self.monthly_fee, self.admission_fee, self.discount):
             field.valueChanged.connect(self._update_total)
+        self.fee_exempt.toggled.connect(self._update_total)
         self._update_total()
 
     def _class_changed(self, index):
@@ -240,17 +266,34 @@ class AdmissionDialog(QDialog):
             self.monthly_fee.setValue(float(self.classes[index]["monthly_fee"]))
 
     def _update_total(self):
-        value = self.monthly_fee.value() + self.admission_fee.value() - self.discount.value()
+        value = self._net_total()
         self.total_label.setText(money(value))
+        self.fee_exempt.setEnabled(value == 0)
+        if value > 0:
+            self.fee_exempt.setChecked(False)
+            self.status_hint.setText("Unpaid — payment will be recorded separately.")
+        elif value == 0 and self.fee_exempt.isChecked():
+            self.status_hint.setText("No payment due — the student is fee-exempt; no payment is being recorded.")
+        elif value == 0:
+            self.status_hint.setText("Enter the fee amount, or select Fee-exempt / no charges to confirm an intentional zero-fee admission.")
+        else:
+            self.status_hint.setText("The discount cannot exceed the assessed charges.")
+
+    def _net_total(self):
+        return Decimal(str(self.monthly_fee.value())) + Decimal(str(self.admission_fee.value())) - Decimal(str(self.discount.value()))
 
     def _save(self):
+        if self.result() == QDialog.Accepted:
+            return
         try:
             if not all((self.name.text().strip(), self.guardian.text().strip(), self.phone.text().strip())):
                 raise ValueError("Student name, guardian name and contact number are required.")
             if self.class_picker.currentData() is None:
                 raise ValueError("Choose a class before saving the admission.")
-            if self.discount.value() > self.monthly_fee.value() + self.admission_fee.value():
+            if self._net_total() < 0:
                 raise ValueError("The discount cannot exceed the tuition and admission fee.")
+            if self._net_total() == 0 and not self.fee_exempt.isChecked():
+                raise ValueError("The initial challan has no charges. Enter the tuition/admission fee, or explicitly select Fee-exempt / no charges. A zero-fee admission does not record a payment.")
             self.buttons.button(QDialogButtonBox.Save).setEnabled(False)
             self.result_record = self.service.admit_student(
                 full_name=self.name.text().strip(),
@@ -264,6 +307,7 @@ class AdmissionDialog(QDialog):
                 due_date=self.due_date.date().toString(Qt.ISODate),
                 address=self.address.toPlainText().strip(),
                 notes=self.notes.toPlainText().strip(),
+                fee_exempt=self.fee_exempt.isChecked(),
             )
             self.accept()
         except Exception as exc:
@@ -278,6 +322,7 @@ class EditStudentDialog(QDialog):
         super().__init__(parent)
         self.service = service
         self.student = student
+        self.fee_changed = False
         self.setWindowTitle("Edit student profile")
         self.resize(700, 690)
         outer = QVBoxLayout(self)
@@ -325,7 +370,7 @@ class EditStudentDialog(QDialog):
         scroll.setWidget(content)
         content.setAutoFillBackground(False)
         outer.addWidget(scroll, 1)
-        outer.addWidget(_note("Monthly fee changes apply to future challans. Existing challan amounts and payment history stay unchanged. Inactive students remain in the directory and fee history but cannot receive new challans."))
+        outer.addWidget(_note("This monthly fee is the default for future challans. To correct an existing bill, select it in Fees & collections and choose Amend challan. Bills with any payment history cannot be amended. Inactive students retain their records but cannot receive new challans."))
         self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         self.buttons.button(QDialogButtonBox.Save).setText("Save profile")
         self.buttons.button(QDialogButtonBox.Save).setObjectName("primary")
@@ -334,6 +379,8 @@ class EditStudentDialog(QDialog):
         outer.addWidget(self.buttons)
 
     def _save(self):
+        if self.result() == QDialog.Accepted:
+            return
         try:
             if not all((self.name.text().strip(), self.guardian.text().strip(), self.phone.text().strip())):
                 raise ValueError("Student name, guardian name and contact number are required.")
@@ -351,6 +398,7 @@ class EditStudentDialog(QDialog):
                 notes=self.notes.toPlainText().strip(),
                 status=self.status.currentData(),
             )
+            self.fee_changed = Decimal(str(self.monthly_fee.value())) != Decimal(str(self.student["monthly_fee"]))
             self.accept()
         except Exception as exc:
             self.buttons.button(QDialogButtonBox.Save).setEnabled(True)
@@ -393,7 +441,12 @@ class StudentsPage(BasePage):
         self.search = QLineEdit()
         self.search.setPlaceholderText("Student name, registration number or contact number")
         self.search.setClearButtonEnabled(True)
-        self.search.textChanged.connect(self._load_students)
+        self.search.setToolTip("Search the student register. Press Ctrl+F to focus this field; use the clear button to reset the search.")
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(180)
+        self._search_timer.timeout.connect(self._load_students)
+        self.search.textChanged.connect(lambda *_: self._search_timer.start())
         search_row.addWidget(self.search, 1)
         self.count = QLabel()
         self.count.setObjectName("countBadge")
@@ -462,6 +515,9 @@ class StudentsPage(BasePage):
 
     def refresh(self):
         try:
+            class_id = selected_id(self.classes_table)
+            vertical = self.classes_table.verticalScrollBar().value()
+            horizontal = self.classes_table.horizontalScrollBar().value()
             self.classes = self.service.list_classes()
             fill_table(
                 self.classes_table,
@@ -469,6 +525,7 @@ class StudentsPage(BasePage):
                 [group["id"] for group in self.classes],
             )
             _register_columns(self.classes_table, (0, 1, 2), (3,))
+            _restore_table_view(self.classes_table, class_id, vertical, horizontal)
             self.class_empty.setVisible(not self.classes)
             self._load_students()
         except Exception as exc:
@@ -476,6 +533,10 @@ class StudentsPage(BasePage):
 
     def _load_students(self, *_):
         try:
+            self._search_timer.stop()
+            student_id = selected_id(self.students_table)
+            vertical = self.students_table.verticalScrollBar().value()
+            horizontal = self.students_table.horizontalScrollBar().value()
             self.students = self.service.list_students(self.search.text().strip())
             fill_table(
                 self.students_table,
@@ -483,11 +544,17 @@ class StudentsPage(BasePage):
                 [s["id"] for s in self.students],
             )
             _register_columns(self.students_table, (1, 2, 3), (5,))
+            _restore_table_view(self.students_table, student_id, vertical, horizontal)
             self.count.setText(f"Records: {len(self.students):,}")
             self.empty.setVisible(not self.students)
             self.empty.setText("No records match the specified search criteria." if self.search.text().strip() else "No admission records. Register a class before entering a new admission.")
         except Exception as exc:
             show_error(self, exc)
+
+    def focus_search(self):
+        self.tabs.setCurrentIndex(0)
+        self.search.setFocus()
+        self.search.selectAll()
 
     def _add_class(self):
         try:
@@ -511,7 +578,7 @@ class StudentsPage(BasePage):
                 self.refresh()
                 self.changed.emit()
                 result = dialog.result_record
-                success(self, f"{result['student']['full_name']} is enrolled.\n\nStudent ID: {result['student']['student_number']}\nFirst challan: {result['challan']['number']}\n\nOpen Fees & payments to print the challan or record a payment.")
+                success(self, f"{result['student']['full_name']} is enrolled.\n\nStudent ID: {result['student']['student_number']}\nFirst challan: {result['challan']['number']}\nStatus: {result['challan']['status']}\n\nOpen Fees & collections to print the challan or record a payment.")
         except Exception as exc:
             show_error(self, exc)
 
@@ -590,5 +657,7 @@ class StudentsPage(BasePage):
             if dialog.exec() == QDialog.Accepted:
                 self.refresh()
                 self.changed.emit()
+                if dialog.fee_changed:
+                    success(self, "Student profile saved. The revised monthly fee applies to future challans.\n\nTo correct an existing unpaid or zero-fee bill, open Fees & collections, select the bill, and choose Amend challan. Bills with payment history remain unchanged.")
         except Exception as exc:
             show_error(self, exc)

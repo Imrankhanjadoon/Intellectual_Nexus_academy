@@ -6,7 +6,7 @@ import csv
 from datetime import date
 from pathlib import Path
 
-from PySide6.QtCore import QDate, Qt
+from PySide6.QtCore import QDate, Qt, QTimer
 from PySide6.QtWidgets import (
     QComboBox,
     QDateEdit,
@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QTabWidget,
@@ -86,6 +87,7 @@ class AttendancePage(BasePage):
         date_field.addWidget(QLabel("Attendance date"))
         self.date_edit = QDateEdit(QDate.currentDate())
         self.date_edit.setCalendarPopup(True)
+        self.date_edit.setKeyboardTracking(False)
         self.date_edit.setDisplayFormat("dd MMM yyyy")
         date_field.addWidget(self.date_edit)
         controls.addLayout(date_field, 1)
@@ -157,15 +159,25 @@ class AttendancePage(BasePage):
     def _selection_changed(self, *_):
         if self._loading:
             return
-        matches = self._selection_key() == self._loaded_key
-        self._set_editable(matches)
-        if matches and self._loaded_key:
+        if self._selection_key() == self._loaded_key and self._loaded_key:
+            self._set_editable(True)
             self.filter_hint.setText(
                 "Changes are saved only when you select Save attendance."
             )
-        else:
-            suffix = " Your unsaved roster is still shown below." if self._dirty else ""
-            self.filter_hint.setText("Select Load roster to open this class and date." + suffix)
+            return
+        self._load_roster()
+
+    def _restore_loaded_selection(self):
+        if self._loaded_key is None:
+            return
+        self._loading = True
+        try:
+            self.class_combo.setCurrentIndex(self.class_combo.findData(self._loaded_key[0]))
+            self.date_edit.setDate(QDate.fromString(self._loaded_key[1], "yyyy-MM-dd"))
+        finally:
+            self._loading = False
+        self._set_editable(True)
+        self.filter_hint.setText("Unsaved attendance is preserved. Save the register before switching class or date.")
 
     def _can_replace(self):
         if not self._dirty:
@@ -224,6 +236,7 @@ class AttendancePage(BasePage):
         if key is None:
             return
         if not self._can_replace():
+            self._restore_loaded_selection()
             return
         try:
             roster = self.service.attendance_roster(*key)
@@ -257,7 +270,10 @@ class AttendancePage(BasePage):
             self._update_summary()
         except Exception as exc:
             self._loading = False
-            self._set_editable(False)
+            if self._loaded_key is not None:
+                self._restore_loaded_selection()
+            else:
+                self._set_editable(False)
             show_error(self, exc)
 
     def _mark_dirty(self, *_):
@@ -316,6 +332,11 @@ class ReportsPage(BasePage):
     def __init__(self, service, parent=None):
         super().__init__(service, parent)
         self._report: dict = {}
+        self._filtered_defaulters = []
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(180)
+        self._filter_timer.timeout.connect(self._render_defaulters)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 28, 30, 28)
         layout.setSpacing(20)
@@ -379,6 +400,19 @@ class ReportsPage(BasePage):
         self.export_overdue_button.clicked.connect(self._export_overdue)
         toolbar.addWidget(self.export_overdue_button)
         overdue_layout.addLayout(toolbar)
+        search_row = QHBoxLayout()
+        search_row.setSpacing(10)
+        self.search = QLineEdit()
+        self.search.setObjectName("search")
+        self.search.setAccessibleName("Search overdue fees")
+        self.search.setPlaceholderText("Search student, registration ID, class or challan number…")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(lambda *_: self._filter_timer.start())
+        search_row.addWidget(self.search, 1)
+        self.clear_filter = QPushButton("Clear search")
+        self.clear_filter.clicked.connect(self._clear_filter)
+        search_row.addWidget(self.clear_filter)
+        overdue_layout.addLayout(search_row)
         self.overdue_table = table(["CHALLAN NO.", "STUDENT NAME", "CLASS / BATCH", "DUE DATE", "TOTAL (PKR)", "BALANCE (PKR)"])
         self.overdue_table.setMinimumHeight(130)
         overdue_layout.addWidget(self.overdue_table, 1)
@@ -402,8 +436,8 @@ class ReportsPage(BasePage):
         self.tabs.addTab(monthly, "Monthly collection statement")
         report_body.addWidget(self.tabs, 1)
         note = QLabel(
-            "Amounts are in Pakistani rupees (PKR). Reversed entries are excluded from collections. "
-            "Verify bank transfers before entering a receipt."
+            "Summary totals include all records. The overdue search filters the register and its CSV export. "
+            "Amounts are in PKR; reversed entries are excluded from collections."
         )
         note.setObjectName("muted")
         note.setWordWrap(True)
@@ -418,31 +452,8 @@ class ReportsPage(BasePage):
             self.metrics["month_collected"].setText(money(report["month_collected"]))
             self.metrics["outstanding"].setText(money(report["outstanding"]))
             self.metrics["overdue_count"].setText(str(report["overdue_count"]))
-            defaulters = report.get("defaulters", [])
-            fill_table(
-                self.overdue_table,
-                [
-                    [
-                        item["number"],
-                        item["student_name"],
-                        item.get("class_name", "—"),
-                        item["due_date"],
-                        money(item["total"]),
-                        money(item["balance"]),
-                    ]
-                    for item in defaulters
-                ],
-                [item["id"] for item in defaulters],
-            )
-            for row in range(self.overdue_table.rowCount()):
-                for column in (4, 5):
-                    self.overdue_table.item(row, column).setTextAlignment(
-                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-                    )
-            self.overdue_hint.setText(
-                f"{len(defaulters)} challan{'s' if len(defaulters) != 1 else ''} awaiting follow-up."
-                if defaulters else "No overdue fees. New overdue challans will appear here."
-            )
+            self._filter_timer.stop()
+            self._render_defaulters()
             months = report.get("monthly_collection", [])
             fill_table(self.monthly_table, [[item["month"], money(item["amount"])] for item in months])
             for row in range(self.monthly_table.rowCount()):
@@ -453,11 +464,55 @@ class ReportsPage(BasePage):
                 "Collections grouped by payment month, after reversals."
                 if months else "No collections recorded yet."
             )
-            self.export_overdue_button.setEnabled(bool(defaulters))
             self.export_monthly_button.setEnabled(bool(months))
         except Exception as exc:
             self.export_overdue_button.setEnabled(False)
             self.export_monthly_button.setEnabled(False)
+            show_error(self, exc)
+
+    def _clear_filter(self):
+        self.search.clear()
+        self._filter_timer.stop()
+        self._render_defaulters()
+        self.search.setFocus()
+
+    def _matching_defaulters(self):
+        tokens = self.search.text().strip().casefold().split()
+        return [
+            item for item in self._report.get("defaulters", [])
+            if all(token in " ".join(str(item.get(key, "")) for key in (
+                "number", "student_number", "student_name", "class_name", "due_date",
+            )).casefold() for token in tokens)
+        ]
+
+    def _render_defaulters(self):
+        try:
+            defaulters = self._matching_defaulters()
+            self._filtered_defaulters = defaulters
+            fill_table(
+                self.overdue_table,
+                [[
+                    item["number"], item["student_name"], item.get("class_name", "—"),
+                    item["due_date"], money(item["total"]), money(item["balance"]),
+                ] for item in defaulters],
+                [item["id"] for item in defaulters],
+            )
+            for row in range(self.overdue_table.rowCount()):
+                for column in (4, 5):
+                    self.overdue_table.item(row, column).setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    )
+            total = len(self._report.get("defaulters", []))
+            if total:
+                self.overdue_hint.setText(f"{len(defaulters)} of {total} overdue challans shown.")
+                if not defaulters:
+                    self.overdue_hint.setText("No overdue challans match this search. Clear the search to view all.")
+            else:
+                self.overdue_hint.setText("No overdue fees. New overdue challans will appear here.")
+            self.clear_filter.setEnabled(bool(self.search.text()))
+            self.export_overdue_button.setEnabled(bool(defaulters))
+        except Exception as exc:
+            self.export_overdue_button.setEnabled(False)
             show_error(self, exc)
 
     def _export(self, name, headers, rows):
@@ -485,6 +540,8 @@ class ReportsPage(BasePage):
         # Re-authorize the request, so deactivated accounts cannot export stale data.
         try:
             self._report = self.service.reports()
+            self._filter_timer.stop()
+            self._render_defaulters()
             self._export(
                 "overdue",
                 ["Challan", "Student ID", "Student", "Class / batch", "Due date", "Total PKR", "Paid PKR", "Balance PKR"],
@@ -493,7 +550,7 @@ class ReportsPage(BasePage):
                         item["number"], item["student_number"], item["student_name"],
                         item.get("class_name", ""), item["due_date"], item["total"], item["paid"], item["balance"],
                     ]
-                    for item in self._report.get("defaulters", [])
+                    for item in self._filtered_defaulters
                 ],
             )
         except Exception as exc:

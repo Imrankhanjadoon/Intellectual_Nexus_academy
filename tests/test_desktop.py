@@ -73,8 +73,8 @@ def test_first_run_setup_and_subsequent_login(qapp, ui_messages, tmp_path, monke
     service = AcademyService(tmp_path / "first-run")
     codes = []
     monkeypatch.setattr(
-        auth.RecoveryCodeDialog, "exec",
-        lambda dialog: codes.append(dialog.code_field.text()) or QDialog.DialogCode.Accepted,
+        auth.AuthWindow, "offer_recovery_file",
+        lambda window, code: codes.append(code) or True,
     )
     try:
         window = auth.AuthWindow(service)

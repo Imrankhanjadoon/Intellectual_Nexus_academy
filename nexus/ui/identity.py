@@ -115,6 +115,9 @@ def line_icon(name, color="#536b87", size=22):
         p.drawEllipse(QRectF(4, 4, 16, 16)); p.drawEllipse(QRectF(9, 9, 6, 6))
         for a, b, c, d in ((12, 1, 12, 4), (12, 20, 12, 23), (1, 12, 4, 12), (20, 12, 23, 12), (4, 4, 6, 6), (18, 18, 20, 20), (4, 20, 6, 18), (18, 6, 20, 4)):
             p.drawLine(a, b, c, d)
+    elif name == "search":
+        p.drawEllipse(QRectF(3, 3, 13, 13))
+        p.drawLine(15, 15, 22, 22)
     elif name == "logout":
         p.drawLine(11, 3, 4, 3); p.drawLine(4, 3, 4, 21); p.drawLine(4, 21, 11, 21)
         p.drawLine(10, 12, 22, 12); p.drawLine(18, 8, 22, 12); p.drawLine(18, 16, 22, 12)

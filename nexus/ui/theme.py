@@ -8,7 +8,7 @@ QWidget { color: #25354a; }
 QWidget#documentPage, QWidget#dashboardPage, QStackedWidget { background: #f4f6f9; }
 QWidget#navigationMenu { background: #ffffff; }
 QLabel { background: transparent; }
-QLabel#pageTitle { color: #173657; font-size: 26px; font-weight: 600; }
+QLabel#pageTitle { color: #173657; font-size: 25px; font-weight: 600; }
 QLabel#muted { color: #68788b; font-size: 12px; }
 QLabel#eyebrow, QLabel#fieldLabel { color: #536c88; font-size: 11px; font-weight: 600; }
 QLabel#metric { color: #123766; font-size: 30px; font-weight: 600; }
@@ -52,6 +52,8 @@ QPushButton#primary:disabled { color: #f5f7fa; background: #a8b9cf; border-color
 QPushButton#danger { color: #943c45; background: #fffafb; border-color: #dfc6cc; }
 QPushButton#quiet { color: #265486; background: transparent; border: none; padding: 8px 10px; }
 QPushButton#quiet:hover { background: #edf3fb; }
+QPushButton#searchLauncher { color: #7285a1; font-size: 11px; font-weight: 400; min-height: 16px; padding: 5px 12px; border: 1px solid #dce5f1; background: #ffffff; }
+QPushButton#searchLauncher:hover { border-color: #9eb7d9; color: #244c7d; }
 QPushButton#serviceLink { text-align: left; color: #234b7c; background: #ffffff; border: none; border-bottom: 1px solid #e6ebf3; border-radius: 0; padding: 14px 15px; font-size: 12px; font-weight: 500; }
 QPushButton#serviceLink:hover { background: #f4f7fc; }
 QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QDateEdit, QComboBox {
@@ -87,4 +89,8 @@ QStatusBar { color: #7d8b9e; background: #ffffff; border-top: 1px solid #dfe6ef;
 QCheckBox { spacing: 8px; }
 QCheckBox::indicator { width: 16px; height: 16px; }
 QToolTip { color: #ffffff; background: #173e75; border: none; padding: 6px; }
+QProgressBar { border: none; border-radius: 2px; background: #e5ecf6; }
+QProgressBar::chunk { background: #2a5891; border-radius: 2px; }
+QCheckBox::indicator { background: #ffffff; border: 1px solid #becce0; border-radius: 3px; width: 16px; height: 16px; }
+QCheckBox::indicator:checked { image: url(:/nexus/check.svg); background: #214c80; border: 1px solid #214c80; }
 """

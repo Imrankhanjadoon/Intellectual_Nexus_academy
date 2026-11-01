@@ -1,17 +1,15 @@
 """First-run setup and offline authentication screens."""
-from pathlib import Path
-
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QBoxLayout, QDialog, QFileDialog, QFormLayout, QFrame,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
-    QScrollArea, QStackedWidget, QVBoxLayout, QWidget,
+    QMessageBox, QScrollArea, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from .common import show_error
 from .architecture import AcademicArchitecture
 from .identity import AcademySeal
+from .motion import fade_in
 
 
 AUTH_STYLE = """
@@ -79,44 +77,47 @@ def _title(title, description):
     return holder
 
 
-class RecoveryCodeDialog(QDialog):
-    """Show a newly issued recovery code without persisting it automatically."""
+class RecoveryFileDialog(QDialog):
+    """Save a private recovery file without displaying its secret contents."""
 
-    def __init__(self, code, parent=None):
+    def __init__(self, service, recovery_code, parent=None):
         super().__init__(parent)
+        self.service = service
+        self._recovery_code = recovery_code
         self.setObjectName("recoveryDocument")
         self.setStyleSheet(AUTH_STYLE)
-        self.setWindowTitle("Save your owner recovery code")
-        self.setMinimumWidth(540)
+        self.setWindowTitle("Save your recovery file")
+        self.setMinimumWidth(520)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(26, 26, 26, 26)
-        layout.setSpacing(16)
-        section = QLabel("OWNER ACCOUNT · CONFIDENTIAL RECORD")
+        layout.setContentsMargins(30, 28, 30, 28)
+        layout.setSpacing(20)
+        section = QLabel("ACCOUNT PROTECTION")
         section.setObjectName("authSection")
         layout.addWidget(section)
-        layout.addWidget(_title("Owner recovery code", "Retain this code for offline password recovery. It is displayed once. Store it separately from the academy database and do not share it with staff."))
-        self.code_field = QLineEdit(code)
-        self.code_field.setReadOnly(True)
-        self.code_field.setMinimumHeight(48)
-        self.code_field.setStyleSheet("font-family: monospace; font-size: 15px; background: #ffffff; color: #173e75; border: 1px solid #b9c5d2; border-radius: 0;")
-        layout.addWidget(self.code_field)
-        row = QHBoxLayout()
-        row.addWidget(_button("Copy code", lambda: QGuiApplication.clipboard().setText(code)))
-        row.addWidget(_button("Save recovery file…", lambda: self._save(code)))
-        layout.addLayout(row)
-        note = QLabel("Anyone with this code and the owner username can reset the owner password. A used code is replaced with a new one.")
-        note.setWordWrap(True)
-        note.setStyleSheet("color: #8c754f;")
-        layout.addWidget(note)
-        layout.addWidget(_button("I have saved my recovery code", self.accept, True))
+        layout.addWidget(_title("Save your recovery file", "If you forget your password, choose this file on the Reset password screen to set a new one."))
+        instructions = QLabel("Save the file to a private USB drive or another safe location. Anyone with this file can reset the academy administrator's password, so keep it separate from the academy database.")
+        instructions.setWordWrap(True)
+        instructions.setStyleSheet("color: #6c7b8e; font-size: 13px;")
+        layout.addWidget(instructions)
+        layout.addWidget(_button("Save recovery file…", self._save, True))
+        later = _button("Save later", self.reject)
+        later.setObjectName("quiet")
+        layout.addWidget(later)
 
-    def _save(self, code):
-        destination, _ = QFileDialog.getSaveFileName(self, "Save owner recovery code", "nexus-owner-recovery.txt", "Text file (*.txt)")
+    def _save(self):
+        destination, _ = QFileDialog.getSaveFileName(
+            self, "Save recovery file", "academy-recovery.nexus-key",
+            "Nexus recovery file (*.nexus-key)",
+        )
         if not destination:
             return
+        if not destination.lower().endswith(".nexus-key"):
+            destination += ".nexus-key"
         try:
-            Path(destination).write_text("Intellectual Nexus Academy — owner recovery code\n\n" + code + "\n\nStore this privately, away from your academy database.\n", encoding="utf-8")
-        except OSError as exc:
+            self.service.save_recovery_file(destination, recovery_code=self._recovery_code)
+            self._recovery_code = None
+            self.accept()
+        except Exception as exc:
             show_error(self, exc)
 
 
@@ -126,6 +127,9 @@ class AuthWindow(QMainWindow):
     def __init__(self, service):
         super().__init__()
         self.service = service
+        self._busy = False
+        self._submit_button = None
+        self._submit_text = ""
         self.setWindowTitle("Intellectual Nexus Academy | Administration Portal")
         self.resize(1280, 860)
         self.setMinimumSize(900, 720)
@@ -228,7 +232,7 @@ class AuthWindow(QMainWindow):
         description.setStyleSheet("font-size: 13px; color: #c8d6e8;")
         layout.addWidget(description)
         layout.addSpacing(4)
-        for index, label in enumerate(("01   Staff sign in", "02   Staff registration", "03   Owner account recovery")):
+        for index, label in enumerate(("01   Staff sign in", "02   Staff registration", "03   Reset password")):
             button = QPushButton(label)
             button.setMinimumHeight(38)
             button.setCheckable(True)
@@ -295,13 +299,16 @@ class AuthWindow(QMainWindow):
         return button
 
     def _go(self, index):
+        if self._busy:
+            return
         self.login_password.clear()
         self.signup_password.clear()
         self.signup_confirm.clear()
         self.recovery_password.clear()
         self.recovery_confirm.clear()
-        self.recovery_code.clear()
+        self.recovery_file.clear()
         self.pages.setCurrentIndex(index)
+        fade_in(self.pages.currentWidget())
 
     def _login_page(self):
         page, layout = self._page("Staff sign in", "Enter your assigned account details to access academy records.", "ACCOUNT ACCESS")
@@ -313,7 +320,8 @@ class AuthWindow(QMainWindow):
         form.addRow("Password", self.login_password)
         layout.addLayout(form)
         self.login_password.returnPressed.connect(self._login)
-        layout.addWidget(_button("Sign in", self._login, True))
+        self.login_button = _button("Sign in", self._login, True)
+        layout.addWidget(self.login_button)
         self.login_message = QLabel("")
         self.login_message.setWordWrap(True)
         self.login_message.setStyleSheet("color: #244c7f; font-size: 12px;")
@@ -325,7 +333,7 @@ class AuthWindow(QMainWindow):
         links = QHBoxLayout()
         links.addWidget(self._link("Staff account registration", lambda: self._go(1)))
         links.addStretch()
-        links.addWidget(self._link("Owner account recovery", lambda: self._go(2)))
+        links.addWidget(self._link("Forgot password?", lambda: self._go(2)))
         layout.addLayout(links)
         notice = QLabel("New staff registrations require approval by the academy administrator.")
         notice.setWordWrap(True)
@@ -346,26 +354,50 @@ class AuthWindow(QMainWindow):
         form.addRow("Password", self.signup_password)
         form.addRow("Confirm", self.signup_confirm)
         layout.addLayout(form)
-        layout.addWidget(_button("Submit registration request", self._signup, True))
+        self.signup_button = _button("Submit registration request", self._signup, True)
+        layout.addWidget(self.signup_button)
         layout.addWidget(self._link("Return to sign in", lambda: self._go(0)))
         return page
 
     def _recovery_page(self):
-        page, layout = self._page("Owner account recovery", "Enter the private code issued during setup. Staff password resets must be requested from the administrator.", "ACCOUNT SERVICES / PASSWORD RECOVERY")
-        self.recovery_username = _field("Owner username")
-        self.recovery_code = _field("Private recovery code", True)
-        self.recovery_password = _field("New password · at least 10 characters", True)
+        page, layout = self._page(
+            "Reset password", "Choose your saved recovery file and enter a new password.",
+            "ACCOUNT SERVICES / PASSWORD RESET",
+        )
+        self.recovery_file = _field("Choose your saved .nexus-key file")
+        self.recovery_file.setReadOnly(True)
+        picker = QWidget()
+        picker_layout = QHBoxLayout(picker)
+        picker_layout.setContentsMargins(0, 0, 0, 0)
+        picker_layout.setSpacing(10)
+        picker_layout.addWidget(self.recovery_file, 1)
+        picker_layout.addWidget(_button("Choose file…", self._choose_recovery_file))
+        self.recovery_password = _field("At least 10 characters", True)
         self.recovery_confirm = _field("Repeat new password", True)
         form = QFormLayout()
         form.setVerticalSpacing(14)
-        form.addRow("Username", self.recovery_username)
-        form.addRow("Recovery code", self.recovery_code)
+        form.addRow("Recovery file", picker)
         form.addRow("New password", self.recovery_password)
         form.addRow("Confirm", self.recovery_confirm)
         layout.addLayout(form)
-        layout.addWidget(_button("Reset owner password", self._recover, True))
+        self.recovery_button = _button("Reset password", self._recover, True)
+        layout.addWidget(self.recovery_button)
+        note = QLabel("Staff members: ask your academy administrator to reset your password. The administrator's recovery file is saved during setup or from Administration.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #6c7b8e; font-size: 12px;")
+        layout.addWidget(note)
         layout.addWidget(self._link("Return to sign in", lambda: self._go(0)))
         return page
+
+    def _choose_recovery_file(self):
+        if self._busy:
+            return
+        source, _ = QFileDialog.getOpenFileName(
+            self, "Choose recovery file", "", "Nexus recovery file (*.nexus-key)",
+        )
+        if source:
+            self.recovery_file.setText(source)
+            self.recovery_file.setToolTip(source)
 
     def _setup_page(self):
         page, layout = self._page("Initial academy setup", "Complete the academy particulars and create the owner account for this local installation.", "GETTING STARTED / LOCAL INSTALLATION", 700)
@@ -397,49 +429,100 @@ class AuthWindow(QMainWindow):
             column.addStretch()
             columns.addLayout(column, 1)
         layout.addLayout(columns)
-        note = QLabel("An owner recovery code will be issued after registration. Retain it separately from the academy database for offline account recovery.")
+        note = QLabel("After setup, save a recovery file to a private USB drive or another safe location. You can use it to reset a forgotten password without internet.")
         note.setWordWrap(True)
         note.setStyleSheet("color: #6c7b8e; font-size: 12px;")
         layout.addWidget(note)
-        layout.addWidget(_button("Complete initial setup", self._setup, True))
+        self.setup_button = _button("Complete initial setup", self._setup, True)
+        layout.addWidget(self.setup_button)
         return page
 
+    def _begin_submit(self, button, message):
+        if self._busy:
+            return False
+        self._busy = True
+        self._submit_button = button
+        self._submit_text = button.text()
+        button.setText(message)
+        button.setEnabled(False)
+        button.setCursor(Qt.CursorShape.WaitCursor)
+        # Paint feedback without dispatching a lock/shutdown inside this action.
+        button.repaint()
+        return True
+
+    def _finish_submit(self):
+        if self._submit_button is not None:
+            self._submit_button.setText(self._submit_text)
+            self._submit_button.setEnabled(True)
+            self._submit_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._submit_button = None
+        self._busy = False
+
+    def offer_recovery_file(self, recovery_code):
+        saved = RecoveryFileDialog(self.service, recovery_code, self).exec() == QDialog.DialogCode.Accepted
+        if not saved:
+            QMessageBox.information(
+                self, "Save a recovery file later",
+                "Your academy account has been created. You can save a recovery file later from Administration. Until then, keep your password safe.",
+            )
+        return saved
+
     def _login(self):
+        if not self._begin_submit(self.login_button, "Signing in…"):
+            return
         try:
             self.service.login(self.login_username.text().strip(), self.login_password.text())
-            self.login_password.clear()
-            self.authenticated.emit()
         except Exception as exc:
             self.login_password.clear()
+            self._finish_submit()
             show_error(self, exc)
+            return
+        self.login_password.clear()
+        self.login_button.setText("Opening workspace…")
+        self.authenticated.emit()
 
     def _signup(self):
+        if not self._begin_submit(self.signup_button, "Submitting request…"):
+            return
         try:
             if self.signup_password.text() != self.signup_confirm.text():
                 raise ValueError("The two passwords do not match.")
             self.service.signup(self.signup_name.text().strip(), self.signup_username.text().strip(), self.signup_password.text())
-            self.login_username.setText(self.signup_username.text().strip())
-            self.signup_name.clear()
-            self.signup_username.clear()
-            self._go(0)
-            self.login_message.setText("Account request received. Ask the academy administrator to approve your access before signing in.")
         except Exception as exc:
+            self._finish_submit()
             show_error(self, exc)
+            return
+        self.login_username.setText(self.signup_username.text().strip())
+        self.signup_name.clear()
+        self.signup_username.clear()
+        self._finish_submit()
+        self._go(0)
+        self.login_message.setText("Account request received. Ask the academy administrator to approve your access before signing in.")
 
     def _recover(self):
+        if not self._begin_submit(self.recovery_button, "Resetting password…"):
+            return
         try:
+            if not self.recovery_file.text().strip():
+                raise ValueError("Choose your saved recovery file first.")
             if self.recovery_password.text() != self.recovery_confirm.text():
                 raise ValueError("The two passwords do not match.")
-            username = self.recovery_username.text().strip()
-            code = self.service.recover_owner(username, self.recovery_code.text().strip(), self.recovery_password.text())
-            self._go(0)
-            self.login_username.setText(username)
-            self.login_message.setText("Owner password reset. Sign in with your new password.")
-            RecoveryCodeDialog(code, self).exec()
+            self.service.reset_password_with_file(self.recovery_file.text().strip(), self.recovery_password.text())
         except Exception as exc:
+            self._finish_submit()
             show_error(self, exc)
+            return
+        self._finish_submit()
+        self._go(0)
+        self.login_message.setText("Password reset. Sign in with your new password.")
+        if self.login_username.text().strip():
+            self.login_password.setFocus()
+        else:
+            self.login_username.setFocus()
 
     def _setup(self):
+        if not self._begin_submit(self.setup_button, "Creating academy…"):
+            return
         try:
             if self.owner_password.text() != self.owner_confirm.text():
                 raise ValueError("The two passwords do not match.")
@@ -448,9 +531,18 @@ class AuthWindow(QMainWindow):
                 self.academy_phone.text().strip(), self.owner_name.text().strip(),
                 self.owner_username.text().strip(), self.owner_password.text(),
             )
-            self.owner_password.clear()
-            self.owner_confirm.clear()
-            RecoveryCodeDialog(result["recovery_code"], self).exec()
-            self.authenticated.emit()
         except Exception as exc:
+            self._finish_submit()
             show_error(self, exc)
+            return
+        self.owner_password.clear()
+        self.owner_confirm.clear()
+        self.setup_button.setText("Preparing account…")
+        try:
+            self.offer_recovery_file(result["recovery_code"])
+        except Exception:
+            QMessageBox.information(
+                self, "Academy account created",
+                "Your academy account was created. Save a recovery file later from Administration to protect access if you forget your password.",
+            )
+        self.authenticated.emit()

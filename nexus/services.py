@@ -11,6 +11,9 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import os
+import json
+import stat
+import tempfile
 from pathlib import Path
 import re
 import secrets
@@ -207,11 +210,10 @@ class AcademyService:
         self._db.execute("BEGIN IMMEDIATE")
         try:
             yield
+            self._db.commit()
         except BaseException:
             self._db.rollback()
             raise
-        else:
-            self._db.commit()
 
     def _public_user(self, row):
         return {key: row[key] for key in ("id", "full_name", "username", "role", "status")}
@@ -330,24 +332,158 @@ class AcademyService:
         self.user = None
         self._session_id = None
 
-    def recover_owner(self, username, recovery_code, new_password):
+    def _verified_recovery_owner(self, username, recovery_code):
         username = _username(username)
-        _password(new_password)
         row = self._db.execute("SELECT * FROM users WHERE username=? AND is_owner=1", (username,)).fetchone()
         if row and row["locked_until"] and row["locked_until"] > _now():
             raise PermissionError("Too many attempts. Wait one minute and try again.")
         code = str(recovery_code).strip().upper()
-        if len(code) > 200:
-            raise PermissionError("Username or recovery code is incorrect.")
-        if not self._verify(row["recovery_hash"] if row else self._dummy_hash, code) or not row:
+        if len(code) > 200 or not self._verify(row["recovery_hash"] if row else self._dummy_hash, code) or not row:
             self._failed_login(row)
-            raise PermissionError("Username or recovery code is incorrect.")
+            raise PermissionError("This recovery key does not match the academy owner account.")
+        return row
+
+    def recover_owner(self, username, recovery_code, new_password):
+        """Legacy typed-code recovery; new desktop flows use a recovery file."""
+        _password(new_password)
+        row = self._verified_recovery_owner(username, recovery_code)
         new_code = self._recovery_code()
         with self._transaction():
             self._db.execute("UPDATE users SET password_hash=?,recovery_hash=?,failed_attempts=0,locked_until=NULL WHERE id=?", (self._hasher.hash(new_password), self._hasher.hash(new_code), row["id"]))
             self._audit("Owner account recovered", "Recovery code rotated", actor=self._public_user(row))
         self.logout()
         return new_code
+
+    @staticmethod
+    def _write_recovery_file(target, payload):
+        """Install a private, fully written key without replacing any file.
+
+        POSIX hard-link installation and Windows rename both offer atomic
+        no-overwrite semantics. The staged file is fsynced before installation.
+        """
+        temporary = None
+        installed = False
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(prefix=".nexus-key-", suffix=".tmp", dir=target.parent)
+            temporary = Path(temporary_name)
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
+                json.dump(payload, output, ensure_ascii=True, indent=2)
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            if os.name == "nt":
+                os.rename(temporary, target)  # Windows refuses an existing target.
+            else:
+                os.link(temporary, target)  # Atomic O_EXCL-style installation.
+            installed = True
+            if os.name != "nt":
+                directory_fd = os.open(target.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        except BaseException:
+            if installed:
+                target.unlink(missing_ok=True)
+            raise
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def save_recovery_file(self, destination, recovery_code=None, current_password=None):
+        """Save the first-run key, or create a replacement after password proof.
+
+        A replacement invalidates older recovery files only after the new file
+        has been written durably. Failed saves leave the previous key usable.
+        """
+        owner = self._require("admin")
+        if not owner["is_owner"]:
+            raise PermissionError("Only the academy owner can save an owner recovery file.")
+        if (recovery_code is None) == (current_password is None):
+            raise ValueError("Provide either the first-setup recovery key or your current password.")
+        try:
+            target = Path(destination).expanduser().absolute()
+        except (TypeError, ValueError):
+            raise ValueError("Choose a valid recovery-file destination.") from None
+        if target.resolve() == self.db_path.resolve():
+            raise ValueError("A recovery file cannot replace the academy database.")
+        if os.path.lexists(target):
+            raise ValueError("A file already exists there. Choose a new recovery filename.")
+        if not target.parent.is_dir():
+            raise ValueError("The recovery-file folder does not exist.")
+        if owner["locked_until"] and owner["locked_until"] > _now():
+            raise PermissionError("Too many attempts. Wait one minute and try again.")
+        rotate = current_password is not None
+        if rotate:
+            if not isinstance(current_password, str) or len(current_password) > 1024 or not self._verify(owner["password_hash"], current_password):
+                self._failed_login(owner)
+                raise PermissionError("The current owner password is incorrect.")
+            code = self._recovery_code()
+        else:
+            code = str(recovery_code).strip().upper()
+            if len(code) > 200 or not self._verify(owner["recovery_hash"], code):
+                self._failed_login(owner)
+                raise PermissionError("The first-setup recovery key is no longer valid. Use your current password to save a replacement file.")
+        new_hash = self._hasher.hash(code) if rotate else owner["recovery_hash"]
+        payload = {"format": "nexus-recovery-v1", "username": owner["username"], "recovery_code": code}
+        created = False
+        try:
+            with self._transaction():
+                current = self._db.execute("SELECT * FROM users WHERE id=?", (owner["id"],)).fetchone()
+                if not current or current["status"] != "active" or current["password_hash"] != owner["password_hash"] or current["recovery_hash"] != owner["recovery_hash"]:
+                    raise PermissionError("The owner account changed. Sign in again before saving a recovery file.")
+                self._write_recovery_file(target, payload)
+                created = True
+                self._db.execute("UPDATE users SET recovery_hash=?,failed_attempts=0,locked_until=NULL WHERE id=?", (new_hash, owner["id"]))
+                self._audit("Owner recovery file saved", "Replacement key activated; older recovery files invalidated" if rotate else "Initial owner recovery file saved")
+        except BaseException:
+            if created:
+                target.unlink(missing_ok=True)
+            raise
+        return str(target)
+
+    @staticmethod
+    def _read_recovery_file(source):
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("Duplicate recovery-file fields.")
+                result[key] = value
+            return result
+        try:
+            descriptor = os.open(Path(source).expanduser(), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+            with os.fdopen(descriptor, "rb") as incoming:
+                info = os.fstat(incoming.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 8192:
+                    raise ValueError("Invalid recovery file size or type.")
+                raw = incoming.read(8193)
+                if len(raw) > 8192:
+                    raise ValueError("Recovery file is too large.")
+            payload = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+            if not isinstance(payload, dict) or set(payload) != {"format", "username", "recovery_code"} or payload["format"] != "nexus-recovery-v1":
+                raise ValueError("Unsupported recovery-file format.")
+            username = _username(payload["username"])
+            code = payload["recovery_code"]
+            if username != payload["username"] or not isinstance(code, str) or not re.fullmatch(r"[A-Z2-7]{4}(?:-[A-Z2-7]{4}){7}", code):
+                raise ValueError("Invalid recovery-file fields.")
+            return username, code
+        except (OSError, ValueError, TypeError, UnicodeError, RecursionError):
+            raise ValueError("Choose a valid academy recovery file (.nexus-key). The file may be missing, damaged or for another format.") from None
+
+    def reset_password_with_file(self, source, new_password):
+        """Reset the owner password while retaining the selected reusable key."""
+        _password(new_password)
+        username, code = self._read_recovery_file(source)
+        owner = self._verified_recovery_owner(username, code)
+        hashed = self._hasher.hash(new_password)
+        with self._transaction():
+            current = self._db.execute("SELECT recovery_hash FROM users WHERE id=? AND is_owner=1", (owner["id"],)).fetchone()
+            if not current or current["recovery_hash"] != owner["recovery_hash"]:
+                raise PermissionError("This recovery file was replaced. Choose the latest owner recovery file.")
+            self._db.execute("UPDATE users SET password_hash=?,failed_attempts=0,locked_until=NULL WHERE id=?", (hashed, owner["id"]))
+            self._audit("Owner password reset using recovery file", "Owner recovery file verified and retained", actor=self._public_user(owner))
+        self.logout()
 
     def has_permission(self, area):
         try:
@@ -489,7 +625,7 @@ class AcademyService:
             params.extend([f"%{search}%"] * 4)
         return [dict(row, monthly_fee=_money(row["monthly_fee"])) for row in self._db.execute(query + " ORDER BY s.id DESC", params)]
 
-    def admit_student(self, full_name, guardian_name, phone, class_id, admission_date, monthly_fee, admission_fee, discount, due_date, address="", notes=""):
+    def admit_student(self, full_name, guardian_name, phone, class_id, admission_date, monthly_fee, admission_fee, discount, due_date, address="", notes="", *, fee_exempt=False):
         self._require("admin", "receptionist")
         full_name = _text(full_name, "Student name")
         guardian_name = _text(guardian_name, "Guardian name")
@@ -497,8 +633,7 @@ class AcademyService:
         class_id = _identifier(class_id)
         admission_date, due_date = _day(admission_date, "Admission date"), _day(due_date, "Due date")
         tuition, other, reduction = _amount(monthly_fee, "Monthly fee"), _amount(admission_fee, "Admission fee"), _amount(discount, "Discount")
-        if reduction > tuition + other:
-            raise ValueError("Discount cannot exceed the total fee.")
+        self._validate_fee_total(tuition, other, reduction, fee_exempt)
         address, notes = _text(address, "Address", 1000, False), _text(notes, "Notes", 3000, False)
         with self._transaction():
             if not self._db.execute("SELECT 1 FROM classes WHERE id=?", (class_id,)).fetchone():
@@ -508,7 +643,7 @@ class AcademyService:
             number = f"NX-{student_id:05d}"
             self._db.execute("UPDATE students SET student_number=? WHERE id=?", (number, student_id))
             challan_id = self._insert_challan(student_id, admission_date[:7], tuition, other, reduction, due_date)
-            self._audit("Student admitted", f"{number}; {full_name}; initial challan #{challan_id}")
+            self._audit("Student admitted", f"{number}; {full_name}; initial challan #{challan_id}" + ("; fee-exempt: no payment due" if tuition + other == reduction else ""))
         student = next(s for s in self.list_students() if s["id"] == student_id)
         return {"student": student, "challan": self.challan_details(challan_id)}
 
@@ -540,24 +675,56 @@ class AcademyService:
         self._db.execute("UPDATE challans SET number=? WHERE id=?", (number, challan_id))
         return challan_id
 
-    def create_challan(self, student_id, period, tuition, discount, due_date, other=0):
+    def create_challan(self, student_id, period, tuition, discount, due_date, other=0, *, fee_exempt=False):
         self._require("admin", "receptionist", "cashier")
         student_id = _identifier(student_id)
         if not isinstance(period, str) or not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", period) or period.startswith("0000"):
             raise ValueError("Fee period must use YYYY-MM, for example 2026-11.")
         tuition, other, discount = _amount(tuition, "Tuition"), _amount(other, "Other fees"), _amount(discount, "Discount")
         due_date = _day(due_date, "Due date")
-        if discount > tuition + other:
-            raise ValueError("Discount cannot exceed the total fee.")
+        self._validate_fee_total(tuition, other, discount, fee_exempt)
         try:
             with self._transaction():
                 if not self._db.execute("SELECT 1 FROM students WHERE id=? AND status='active'", (student_id,)).fetchone():
                     raise ValueError("Select an active student.")
                 challan_id = self._insert_challan(student_id, period, tuition, other, discount, due_date)
-                self._audit("Challan created", f"Challan #{challan_id}; period {period}")
+                self._audit("Challan created", f"Challan #{challan_id}; period {period}" + ("; fee-exempt: no payment due" if tuition + other == discount else ""))
             return self.challan_details(challan_id)
         except sqlite3.IntegrityError:
             raise ValueError("This student already has a challan for that month.") from None
+
+    @staticmethod
+    def _validate_fee_total(tuition, other, discount, fee_exempt):
+        if not isinstance(fee_exempt, bool):
+            raise ValueError("Fee exemption must be explicitly selected.")
+        if discount > tuition + other:
+            raise ValueError("Discount cannot exceed the total fee.")
+        if tuition + other == discount and not fee_exempt:
+            raise ValueError("Enter the actual fee, or explicitly select fee-exempt / no payment due for a zero-total bill.")
+
+    def amend_challan(self, challan_id, tuition, other, discount, due_date, reason, *, fee_exempt=False):
+        """Correct an uncollected bill without changing financial history.
+
+        Even reversed payments make a challan immutable. Student fee defaults
+        are independent, and must be changed through update_student instead.
+        """
+        self._require("admin", "receptionist", "cashier")
+        challan_id = _identifier(challan_id)
+        tuition, other, discount = _amount(tuition, "Tuition"), _amount(other, "Other fees"), _amount(discount, "Discount")
+        self._validate_fee_total(tuition, other, discount, fee_exempt)
+        due_date, reason = _day(due_date, "Due date"), _text(reason, "Amendment reason", 1000)
+        with self._transaction():
+            original = self._db.execute("SELECT * FROM challans WHERE id=?", (challan_id,)).fetchone()
+            if not original:
+                raise ValueError("Challan not found.")
+            if self._db.execute("SELECT 1 FROM payments WHERE challan_id=? LIMIT 1", (challan_id,)).fetchone():
+                raise ValueError("This bill has payment history and cannot be amended, including after a reversal. Keep the original financial record.")
+            total = tuition + other - discount
+            self._db.execute("UPDATE challans SET tuition=?,other=?,discount=?,total=?,due_date=? WHERE id=?", (tuition, other, discount, total, due_date, challan_id))
+            before = f"tuition {_money(original['tuition'])}, other {_money(original['other'])}, discount {_money(original['discount'])}, total {_money(original['total'])}, due {original['due_date']}"
+            after = f"tuition {_money(tuition)}, other {_money(other)}, discount {_money(discount)}, total {_money(total)}, due {due_date}"
+            self._audit("Challan amended", f"{original['number']}; before: {before}; after: {after}; reason: {reason}" + ("; fee-exempt: no payment due" if total == 0 else ""))
+        return self.challan_details(challan_id)
 
     @staticmethod
     def _challan_query():
@@ -569,7 +736,7 @@ class AcademyService:
     def _challan(row):
         result = dict(row)
         balance = row["total"] - row["paid"]
-        result["status"] = "Paid" if balance == 0 else "Partially paid" if row["paid"] else "Unpaid"
+        result["status"] = "No payment due" if row["total"] == 0 else "Paid" if balance == 0 and row["paid"] > 0 else "Partially paid" if row["paid"] else "Unpaid"
         result["balance"] = _money(balance)
         for key in ("tuition", "other", "discount", "total", "paid"):
             result[key] = _money(row[key])
@@ -579,7 +746,7 @@ class AcademyService:
     def list_challans(self, search="", status="All"):
         self._require("admin", "receptionist", "cashier")
         search = _text(search, "Search", 200, False)
-        if status not in {"All", "Unpaid", "Partially paid", "Paid", "Overdue"}:
+        if status not in {"All", "Unpaid", "Partially paid", "Paid", "No payment due", "Overdue"}:
             raise ValueError("Unknown challan status.")
         query, params = self._challan_query(), []
         if search:
