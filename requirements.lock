@@ -1,0 +1,15 @@
+argon2-cffi==23.1.0
+argon2-cffi-bindings==26.1.0
+cffi==2.1.1
+chardet==7.7.0
+iniconfig==2.3.1
+packaging==26.3
+pillow==13.0.0
+pluggy==1.7.0
+pycparser==3.12
+PySide6==6.8.3
+PySide6_Addons==6.8.3
+PySide6_Essentials==6.8.3
+pytest==8.3.5
+reportlab==4.3.1
+shiboken6==6.8.3

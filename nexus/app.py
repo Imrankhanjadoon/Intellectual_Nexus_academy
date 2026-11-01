@@ -1,0 +1,98 @@
+"""Application lifecycle; no servers or Internet connection required."""
+import argparse
+import sys
+from pathlib import Path
+
+from PySide6.QtCore import QEvent, QLockFile, QObject, QTimer
+from PySide6.QtGui import QFont, QIcon
+from PySide6.QtWidgets import QApplication, QMessageBox
+
+from .services import AcademyService, default_data_dir
+from .ui.auth import AuthWindow
+from .ui.shell import MainWindow
+from .ui.theme import STYLE
+from .ui.identity import seal_pixmap
+
+
+class SessionController(QObject):
+    def __init__(self, app, service):
+        super().__init__(app)
+        self.app = app
+        self.service = service
+        self.auth = None
+        self.main = None
+        self.last_window = None
+        self.idle = QTimer(self)
+        self.idle.setSingleShot(True)
+        self.idle.setInterval(15 * 60 * 1000)
+        self.idle.timeout.connect(self.lock)
+        app.installEventFilter(self)
+        self.show_auth()
+
+    def eventFilter(self, watched, event):
+        if self.service.user and event.type() in (
+            QEvent.Type.MouseButtonPress, QEvent.Type.KeyPress, QEvent.Type.Wheel,
+        ):
+            self.idle.start()
+        return False
+
+    def show_auth(self):
+        self.auth = AuthWindow(self.service)
+        self.auth.authenticated.connect(self.open_workspace)
+        self.auth.show()
+
+    def open_workspace(self):
+        self.main = MainWindow(self.service)
+        self.main.logout_requested.connect(self.lock)
+        self.main.show()
+        if self.auth:
+            self.auth.close()
+            self.auth.deleteLater()
+            self.auth = None
+        self.idle.start()
+
+    def lock(self):
+        self.idle.stop()
+        # Close any open entry dialogs before disposing of authenticated pages.
+        # A restored database also deliberately returns to fresh authentication.
+        if self.main is not None:
+            from PySide6.QtWidgets import QDialog
+            for dialog in self.main.findChildren(QDialog):
+                dialog.reject()
+        self.service.logout()
+        self.show_auth()
+        if self.main is not None:
+            self.main.close()
+            self.main.deleteLater()
+            self.main = None
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Intellectual Nexus Academy · offline desktop")
+    parser.add_argument("--data-dir", type=Path, help="Use a separate local data folder (optional)")
+    args = parser.parse_args(argv)
+    app = QApplication(sys.argv[:1])
+    app.setApplicationName("Intellectual Nexus Academy")
+    app.setOrganizationName("Intellectual Nexus")
+    app.setStyle("Fusion")
+    app.setFont(QFont("Segoe UI", 10))
+    app.setWindowIcon(QIcon(seal_pixmap()))
+    app.setStyleSheet(STYLE)
+    try:
+        data_dir = (args.data_dir or default_data_dir()).expanduser().resolve()
+        data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        instance_lock = QLockFile(str(data_dir / ".nexus.lock"))
+        instance_lock.setStaleLockTime(0)
+        if not instance_lock.tryLock(100):
+            QMessageBox.warning(None, "Academy workspace already open", "An instance is already using this data folder. Close it before starting another app or restoring a backup.")
+            return 1
+        service = AcademyService(data_dir)
+    except Exception as exc:
+        QMessageBox.critical(None, "Unable to open academy records", str(exc))
+        return 1
+    controller = SessionController(app, service)
+    app.aboutToQuit.connect(service.close)
+    app.aboutToQuit.connect(instance_lock.unlock)
+    # Retain the controller for the entire Qt event loop.
+    app.session_controller = controller
+    return app.exec()
